@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 #include <debug.h>
 #include <errno.h>
@@ -39,7 +40,28 @@ typedef struct {
     lv_display_t * disp;
     struct lcddev_area_s area;
     struct lcddev_area_align_s align_info;
+    uint32_t render_started_us;
 } lv_nuttx_lcd_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t render_count;
+    uint32_t refresh_time_us;
+    uint32_t flush_count;
+    uint32_t flush_pixels;
+    uint32_t putarea_time_us;
+    uint32_t last_flush_pixels;
+    uint32_t max_flush_pixels;
+    uint32_t ioctl_errors;
+    uint32_t buffer_bytes;
+    uint32_t buffer_rows;
+    uint32_t render_mode;
+} lv_nuttx_lcd_perf_stats_t;
+
+volatile lv_nuttx_lcd_perf_stats_t g_lv_nuttx_lcd_perf_stats
+    __attribute__((used, externally_visible, aligned(4))) = {
+        .magic = 0x4c434636U, /* "LCF6" */
+    };
 
 /**********************
  *  STATIC PROTOTYPES
@@ -51,6 +73,7 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area_p,
                      uint8_t * color_p);
 static lv_display_t * lcd_init(int fd, int hor_res, int ver_res);
 static void display_release_cb(lv_event_t * e);
+static void render_timing_cb(lv_event_t * e);
 
 /**********************
  *  STATIC VARIABLES
@@ -111,6 +134,15 @@ lv_display_t * lv_nuttx_lcd_create(const char * dev_path)
  *   STATIC FUNCTIONS
  **********************/
 
+static uint32_t perf_now_us(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint32_t)((uint64_t)now.tv_sec * 1000000ULL +
+                      (uint32_t)now.tv_nsec / 1000U);
+}
+
 static int32_t align_round_up(int32_t v, uint16_t align)
 {
     return (v + align - 1) & ~(align - 1);
@@ -138,14 +170,47 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area_p,
                      uint8_t * color_p)
 {
     lv_nuttx_lcd_t * lcd = disp->driver_data;
+    uint32_t pixels = (uint32_t)lv_area_get_width(area_p) *
+                      (uint32_t)lv_area_get_height(area_p);
+    uint32_t started;
+    int ret;
 
     lcd->area.row_start = area_p->y1;
     lcd->area.row_end = area_p->y2;
     lcd->area.col_start = area_p->x1;
     lcd->area.col_end = area_p->x2;
+    lcd->area.stride = lv_draw_buf_width_to_stride(
+        lv_area_get_width(area_p), lv_display_get_color_format(disp));
     lcd->area.data = (uint8_t *)color_p;
-    ioctl(lcd->fd, LCDDEVIO_PUTAREA, (unsigned long) & (lcd->area));
+    started = perf_now_us();
+    ret = ioctl(lcd->fd, LCDDEVIO_PUTAREA,
+                (unsigned long) & (lcd->area));
+    g_lv_nuttx_lcd_perf_stats.putarea_time_us += perf_now_us() - started;
+    g_lv_nuttx_lcd_perf_stats.flush_count++;
+    g_lv_nuttx_lcd_perf_stats.flush_pixels += pixels;
+    g_lv_nuttx_lcd_perf_stats.last_flush_pixels = pixels;
+    g_lv_nuttx_lcd_perf_stats.max_flush_pixels =
+        LV_MAX(g_lv_nuttx_lcd_perf_stats.max_flush_pixels, pixels);
+    if(ret < 0) {
+        g_lv_nuttx_lcd_perf_stats.ioctl_errors++;
+    }
     lv_display_flush_ready(disp);
+}
+
+static void render_timing_cb(lv_event_t * e)
+{
+    lv_nuttx_lcd_t * lcd = lv_event_get_user_data(e);
+    lv_event_code_t code = lv_event_get_code(e);
+
+    if(code == LV_EVENT_RENDER_START) {
+        lcd->render_started_us = perf_now_us();
+    }
+    else if(code == LV_EVENT_RENDER_READY && lcd->render_started_us != 0) {
+        g_lv_nuttx_lcd_perf_stats.render_count++;
+        g_lv_nuttx_lcd_perf_stats.refresh_time_us +=
+            perf_now_us() - lcd->render_started_us;
+        lcd->render_started_us = 0;
+    }
 }
 
 static lv_display_t * lcd_init(int fd, int hor_res, int ver_res)
@@ -169,9 +234,11 @@ static lv_display_t * lcd_init(int fd, int hor_res, int ver_res)
 #if LV_NUTTX_LCD_BUFFER_COUNT > 0
     uint32_t buf_size = hor_res * ver_res * px_size;
     lv_display_render_mode_t render_mode = LV_DISPLAY_RENDER_MODE_FULL;
+    uint32_t buffer_rows = ver_res;
 #else
     uint32_t buf_size = hor_res * LV_NUTTX_LCD_BUFFER_SIZE * px_size;
     lv_display_render_mode_t render_mode = LV_DISPLAY_RENDER_MODE_PARTIAL;
+    uint32_t buffer_rows = LV_NUTTX_LCD_BUFFER_SIZE;
 #endif
 
     draw_buf = lv_malloc(buf_size);
@@ -200,8 +267,16 @@ static lv_display_t * lcd_init(int fd, int hor_res, int ver_res)
     lv_display_set_buffers(lcd->disp, draw_buf, draw_buf_2, buf_size, render_mode);
     lv_display_set_flush_cb(lcd->disp, flush_cb);
     lv_display_add_event_cb(lcd->disp, rounder_cb, LV_EVENT_INVALIDATE_AREA, lcd);
+    lv_display_add_event_cb(lcd->disp, render_timing_cb,
+                            LV_EVENT_RENDER_START, lcd);
+    lv_display_add_event_cb(lcd->disp, render_timing_cb,
+                            LV_EVENT_RENDER_READY, lcd);
     lv_display_add_event_cb(lcd->disp, display_release_cb, LV_EVENT_DELETE, lcd->disp);
     lv_display_set_driver_data(lcd->disp, lcd);
+    g_lv_nuttx_lcd_perf_stats.buffer_bytes = buf_size;
+    g_lv_nuttx_lcd_perf_stats.buffer_rows = buffer_rows;
+    g_lv_nuttx_lcd_perf_stats.render_mode =
+        render_mode == LV_DISPLAY_RENDER_MODE_PARTIAL ? 1U : 0U;
 
     return lcd->disp;
 }
